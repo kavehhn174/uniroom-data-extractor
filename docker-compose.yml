@@ -1,0 +1,49 @@
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      # Expose for MongoDB Compass on the host
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  app:
+    build: .
+    env_file:
+      - .env
+    environment:
+      # Always use the compose network hostname for MongoDB
+      MONGO_URI: mongodb://mongo:27017
+      LOG_LEVEL: INFO
+    volumes:
+      - ./input:/app/input
+    depends_on:
+      mongo:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+
+  telegram:
+    build: .
+    command: ["python", "telegram_bot.py"]
+    env_file:
+      - .env
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+      LOG_LEVEL: INFO
+    volumes:
+      - ./input:/app/input
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  mongo_data:
