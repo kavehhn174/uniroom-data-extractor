@@ -83,6 +83,11 @@ def resolve_nim_thinking(explicit: bool | None = None) -> bool:
     return os.environ.get("NIM_THINKING", "0").lower() in ("1", "true", "yes", "on")
 
 
+def resolve_nim_timeout() -> int:
+    """HTTP read timeout for NIM API calls (seconds)."""
+    return max(30, int(os.environ.get("NIM_TIMEOUT_SECONDS", "360")))
+
+
 def _is_kimi_model(model: str) -> bool:
     name = model.lower()
     return "kimi" in name or name.startswith("moonshotai/")
@@ -154,6 +159,7 @@ _LISTING_FIELD_NAMES = frozenset(
     {
         "type",
         "rentPrice",
+        "price",
         "price_eur",
         "isAllInclusive",
         "bills_included",
@@ -162,18 +168,29 @@ _LISTING_FIELD_NAMES = frozenset(
         "street",
         "location",
         "description",
+        "title",
         "raw_text_summary",
         "contactDetails",
+        "contact",
         "contact_info",
         "area",
+        "sizeSqm",
+        "beds",
         "totalPeopleInHouse",
         "peopleInRoom",
         "availabilityDate",
+        "availability",
+        "moveInDate",
         "hasPrivateBathroom",
+        "bathroom",
         "hasResidenza",
+        "registeredStudentHousing",
         "approximateBillsCost",
+        "billsCost",
         "depositAmount",
+        "deposit",
         "hasAgencyFee",
+        "agencyFee",
         "missing_fields",
     }
 )
@@ -350,11 +367,14 @@ def get_nim_client() -> OpenAI:
         raise EnvironmentError(
             "Set NVIDIA_API_KEY or NVAPI_KEY with your NVIDIA NIM API key."
         )
+    timeout_sec = resolve_nim_timeout()
+    log_nim.debug("NIM client timeout=%ds", timeout_sec)
     return OpenAI(
         base_url=os.environ.get(
             "NIM_BASE_URL", "https://integrate.api.nvidia.com/v1"
         ),
         api_key=api_key,
+        timeout=float(timeout_sec),
     )
 
 
@@ -520,45 +540,261 @@ def _contact_details_from_string(text: str) -> ContactDetails:
     return ContactDetails(other=text)
 
 
-def _migrate_legacy_listing_item(item: dict[str, Any]) -> dict[str, Any]:
-    """Map old extractor field names to Uniroom Listing schema."""
-    if item.get("rentPrice") is not None or item.get("type") in ("room", "house"):
-        migrated = dict(item)
+def _valid_geo_coordinates(coords: Any) -> list[float] | None:
+    """Return [lng, lat] only when both are real numbers (Kimi often sends nulls)."""
+    if not isinstance(coords, (list, tuple)) or len(coords) != 2:
+        return None
+    try:
+        lng = float(coords[0])
+        lat = float(coords[1])
+    except (TypeError, ValueError):
+        return None
+    return [lng, lat]
+
+
+def _sanitize_location_field(migrated: dict[str, Any]) -> None:
+    """Drop invalid GeoJSON; move string locations to street."""
+    geo = migrated.get("location")
+    if isinstance(geo, str):
+        street = geo.strip()
+        migrated.pop("location", None)
+        if street and not migrated.get("street"):
+            migrated["street"] = street
+        return
+    if not isinstance(geo, dict):
+        migrated.pop("location", None)
+        return
+    coords = _valid_geo_coordinates(geo.get("coordinates"))
+    if coords is None:
+        migrated.pop("location", None)
     else:
-        room_type = item.get("room_type", "unknown")
-        listing_type: ListingType = "house" if room_type == "apartment" else "room"
-        loc = item.get("location")
-        migrated = {
-            "type": listing_type,
-            "rentPrice": item.get("price_eur"),
-            "isAllInclusive": item.get("bills_included"),
-            "city": item.get("city") or "",
-            "description": item.get("raw_text_summary") or item.get("description"),
-            "missing_fields": list(item.get("missing_fields") or []),
-        }
-        if isinstance(loc, str) and loc.strip():
-            migrated["street"] = loc.strip()
-        elif isinstance(loc, dict):
-            migrated["location"] = loc
-        if item.get("contact_info"):
-            migrated["contactDetails"] = _contact_details_from_string(
-                str(item["contact_info"])
-            ).model_dump()
+        migrated["location"] = {"type": "Point", "coordinates": coords}
+
+
+def _contact_details_from_dict(contact: Any, phone_hint: str | None = None) -> dict[str, Any]:
+    """Map Kimi-style contact objects (booleans + phone) to ContactDetails."""
+    if isinstance(contact, str):
+        return _contact_details_from_string(contact).model_dump()
+    if not isinstance(contact, dict):
+        return ContactDetails().model_dump()
+
+    phone = contact.get("phone")
+    phone_str = str(phone).strip() if phone not in (None, "", False) else ""
+    if not phone_str and phone_hint:
+        phone_str = phone_hint.strip()
+
+    details: dict[str, Optional[str]] = {}
+    if phone_str:
+        details["phone"] = phone_str
+
+    email = contact.get("email")
+    if email not in (None, "", False):
+        details["email"] = str(email).strip()
+
+    for channel in ("whatsapp", "telegram", "sms"):
+        value = contact.get(channel)
+        if value is True and phone_str:
+            details[channel] = phone_str
+        elif isinstance(value, str) and value.strip():
+            details[channel] = value.strip()
+
+    other = contact.get("other")
+    if other not in (None, "", False):
+        details["other"] = str(other).strip()
+
+    return ContactDetails(**details).model_dump()
+
+
+def _coerce_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lower = value.strip().lower()
+        if lower in ("true", "yes", "1"):
+            return True
+        if lower in ("false", "no", "0"):
+            return False
+    return None
+
+
+def _is_non_housing_listing(item: dict[str, Any]) -> bool:
+    other = str(item.get("other") or "").lower()
+    if "not a housing" in other or "not housing" in other:
+        return True
+    title = str(item.get("title") or item.get("description") or "").lower()
+    junk_markers = ("autoscontro", "fuoricarre", "centrofialle")
+    if any(marker in title for marker in junk_markers) and item.get("type") is None:
+        rent = item.get("rentPrice")
+        if rent is None and isinstance(item.get("price"), dict):
+            rent = item["price"].get("rent")
+        if rent is None:
+            return True
+    return False
+
+
+def _map_listing_type(raw_type: Any) -> ListingType | None:
+    if raw_type in ("room", "house"):
+        return raw_type
+    if raw_type in ("apartment", "flat", "property", "entire_place"):
+        return "house"
+    if raw_type in ("bed", "single_room", "shared_room"):
+        return "room"
+    return None
+
+
+def _migrate_kimi_style_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Map Kimi json_object output (price/contact nested) to ListingExtracted."""
+    listing_type = _map_listing_type(item.get("type"))
+    migrated: dict[str, Any] = {
+        "type": listing_type,
+        "city": item.get("city") or "",
+        "neighborhood": item.get("neighborhood") or item.get("neighborhoodDetails"),
+        "street": item.get("street"),
+        "missing_fields": list(item.get("missing_fields") or []),
+    }
+
+    price = item.get("price")
+    if isinstance(price, dict):
+        migrated["rentPrice"] = _coerce_int(price.get("rent"))
+        bills = price.get("billsIncluded")
+        if bills is not None:
+            migrated["isAllInclusive"] = _coerce_bool(bills)
+    else:
+        migrated["rentPrice"] = _coerce_int(item.get("rentPrice") or item.get("price_eur"))
+
+    if item.get("isAllInclusive") is not None and migrated.get("isAllInclusive") is None:
+        migrated["isAllInclusive"] = _coerce_bool(item.get("isAllInclusive"))
+
+    migrated["approximateBillsCost"] = item.get("approximateBillsCost") or item.get(
+        "billsCost"
+    )
+    migrated["area"] = item.get("area") or item.get("sizeSqm")
+    migrated["hasResidenza"] = item.get("hasResidenza")
+    if migrated["hasResidenza"] is None:
+        migrated["hasResidenza"] = _coerce_bool(item.get("registeredStudentHousing"))
+
+    bathroom = item.get("bathroom")
+    if item.get("hasPrivateBathroom") is not None:
+        migrated["hasPrivateBathroom"] = _coerce_bool(item.get("hasPrivateBathroom"))
+    elif isinstance(bathroom, str) and bathroom.strip().lower() in (
+        "private",
+        "en-suite",
+        "ensuite",
+    ):
+        migrated["hasPrivateBathroom"] = True
+    elif bathroom is not None:
+        migrated["hasPrivateBathroom"] = _coerce_bool(bathroom)
+
+    migrated["totalPeopleInHouse"] = item.get("totalPeopleInHouse")
+    migrated["peopleInRoom"] = item.get("peopleInRoom") or item.get("beds")
+    migrated["availabilityDate"] = (
+        item.get("availabilityDate")
+        or item.get("availability")
+        or item.get("moveInDate")
+    )
+    migrated["hasAgencyFee"] = _coerce_bool(item.get("hasAgencyFee") or item.get("agencyFee"))
+    deposit = item.get("depositAmount")
+    if deposit is None:
+        deposit = item.get("deposit")
+    migrated["depositAmount"] = deposit
+
+    title = (item.get("title") or "").strip()
+    desc = (item.get("description") or item.get("raw_text_summary") or "").strip()
+    if title and desc and title not in desc:
+        migrated["description"] = f"{title}. {desc}"[:2000]
+    else:
+        migrated["description"] = (desc or title)[:2000] if (desc or title) else None
+
+    extra = item.get("other")
+    if extra and migrated.get("description"):
+        extra_s = str(extra).strip()
+        if extra_s and extra_s not in migrated["description"]:
+            migrated["description"] = f"{migrated['description']} ({extra_s})"[:2000]
+    elif extra and not migrated.get("description"):
+        migrated["description"] = str(extra).strip()[:2000]
+
+    phone_hint = None
+    if isinstance(item.get("contact"), dict):
+        phone_hint = item["contact"].get("phone")
+    if isinstance(item.get("contactDetails"), dict):
+        migrated["contactDetails"] = _contact_details_from_dict(item["contactDetails"])
+    elif isinstance(item.get("contact"), dict):
+        migrated["contactDetails"] = _contact_details_from_dict(
+            item["contact"], phone_hint=str(phone_hint) if phone_hint else None
+        )
+    elif item.get("contact_info"):
+        migrated["contactDetails"] = _contact_details_from_string(
+            str(item["contact_info"])
+        ).model_dump()
+
+    if isinstance(item.get("location"), dict):
+        migrated["location"] = item["location"]
+
+    return migrated
+
+
+def _migrate_legacy_listing_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Map NIM / legacy field names to Uniroom Listing schema."""
+    if _is_non_housing_listing(item):
+        raise ValueError("non-housing listing")
+
+    uses_kimi_shape = isinstance(item.get("price"), dict) or (
+        isinstance(item.get("contact"), dict) and "contactDetails" not in item
+    )
+    has_schema_fields = item.get("rentPrice") is not None or item.get("type") in (
+        "room",
+        "house",
+    )
+
+    if uses_kimi_shape or not has_schema_fields:
+        if uses_kimi_shape or item.get("room_type") is not None or item.get("price_eur"):
+            migrated = (
+                _migrate_kimi_style_item(item)
+                if uses_kimi_shape
+                else _migrate_kimi_style_item(
+                    {
+                        **item,
+                        "type": "house"
+                        if item.get("room_type") == "apartment"
+                        else item.get("type") or "room",
+                        "rentPrice": item.get("price_eur"),
+                        "isAllInclusive": item.get("bills_included"),
+                    }
+                )
+            )
+        else:
+            migrated = _migrate_kimi_style_item(item)
+    else:
+        migrated = dict(item)
+        if migrated.get("type") not in ("room", "house"):
+            mapped = _map_listing_type(migrated.get("type"))
+            if mapped:
+                migrated["type"] = mapped
 
     if isinstance(migrated.get("contactDetails"), str):
         migrated["contactDetails"] = _contact_details_from_string(
             migrated["contactDetails"]
         ).model_dump()
-    if isinstance(migrated.get("location"), str):
-        street = migrated.pop("location", "").strip()
-        if street and not migrated.get("street"):
-            migrated["street"] = street
+    elif isinstance(migrated.get("contactDetails"), dict):
+        migrated["contactDetails"] = _contact_details_from_dict(
+            migrated["contactDetails"]
+        )
 
-    geo = migrated.get("location")
-    if isinstance(geo, dict):
-        coords = geo.get("coordinates") or []
-        if not (isinstance(coords, list) and len(coords) == 2):
-            migrated["location"] = None
+    _sanitize_location_field(migrated)
+
+    for key in ("price", "contact", "title", "beds", "bathroom", "id"):
+        migrated.pop(key, None)
 
     return migrated
 
@@ -577,6 +813,11 @@ def _validate_listings_payload(payload: dict[str, Any]) -> BulletinBoardExtracti
         try:
             migrated = _migrate_legacy_listing_item(item)
             valid.append(ListingExtracted.model_validate(migrated))
+        except ValueError as exc:
+            if str(exc) == "non-housing listing":
+                log_nim.info("Skipping listing[%d]: not a housing ad", i)
+            else:
+                log_nim.warning("Skipping listing[%d]: %s", i, exc)
         except ValidationError as exc:
             log_nim.warning("Skipping listing[%d]: %s", i, exc)
 
@@ -630,13 +871,16 @@ def extract_listings_from_image(
     response_format = _nim_response_format(schema, NIM_MODEL)
     extra_body = _nim_extra_body(NIM_MODEL, thinking)
 
+    nim_timeout = resolve_nim_timeout()
     log_nim.info(
-        "Calling NVIDIA NIM model=%s max_tokens=%d stream=%s thinking=%s response=%s",
+        "Calling NVIDIA NIM model=%s max_tokens=%d stream=%s thinking=%s "
+        "response=%s timeout=%ds",
         NIM_MODEL,
         NIM_MAX_TOKENS,
         use_stream,
         thinking,
         response_format["type"],
+        nim_timeout,
     )
     if response_format["type"] == "json_schema":
         log_nim.debug("Request: strict JSON schema (BulletinBoardExtraction)")
@@ -662,7 +906,15 @@ def extract_listings_from_image(
         _log_nim_usage(usage)
         return _parse_nim_response(raw)
 
-    response = client.chat.completions.create(**common_kwargs)
+    try:
+        response = client.chat.completions.create(**common_kwargs)
+    except Exception as exc:
+        exc_name = type(exc).__name__
+        if "Timeout" in exc_name or "timeout" in str(exc).lower():
+            raise TimeoutError(
+                f"NIM API did not respond within {nim_timeout} seconds"
+            ) from exc
+        raise
     _log_nim_usage(response.usage)
     raw = response.choices[0].message.content or ""
     return _parse_nim_response(raw)
@@ -901,6 +1153,45 @@ def fetch_review_status_map(filenames: list[str]) -> dict[str, str]:
         }
     except Exception:
         return {}
+
+
+def telegram_user_photo_pattern(chat_id: int) -> str:
+    """Regex prefix for filenames uploaded by a Telegram chat."""
+    return f"^tg_{chat_id}_"
+
+
+def fetch_telegram_user_data(chat_id: int) -> dict[str, Any]:
+    """
+    Listings and reviewed files tied to a Telegram chat (tg_<chat_id>_*.jpg).
+    """
+    pattern = telegram_user_photo_pattern(chat_id)
+    db = get_database()
+    files_collection = get_reviewed_files_collection(db)
+    listings_collection = get_listings_collection(db)
+
+    listing_query = {
+        "$or": [
+            {"source_photo_filename": {"$regex": pattern}},
+            {"source_photo_filenames": {"$regex": pattern}},
+        ]
+    }
+
+    files = list(
+        files_collection.find({"filename": {"$regex": pattern}}).sort(
+            "reviewed_at", -1
+        )
+    )
+    listings = list(
+        listings_collection.find(listing_query).sort("last_seen_date", -1)
+    )
+
+    return {
+        "database": db.name,
+        "listings_collection": COLLECTION_NAME,
+        "files_collection": FILES_COLLECTION_NAME,
+        "files": files,
+        "listings": listings,
+    }
 
 
 def get_listings_collection(db: Database | None = None) -> Collection:

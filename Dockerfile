@@ -10,7 +10,7 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY logging_config.py process_bulletin_board.py select_photo.py telegram_bot.py ./
+COPY logging_config.py process_bulletin_board.py select_photo.py telegram_bot.py telegram_queue.py ./
 
 RUN mkdir -p /app/input
 
